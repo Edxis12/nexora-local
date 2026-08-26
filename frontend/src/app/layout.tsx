@@ -1,22 +1,22 @@
 import type { Metadata } from 'next';
 import './globals.css';
-import { CartProvider } from '../context/CartContext';
+import { CartProvider } from '@/src/context/CartContext';
 
 export const metadata: Metadata = {
-    title: 'NEXORA - Menú y Pedidos',
-    description: 'Sistema de comandas y atención digital local',
+  title: 'NEXORA - Menú y Pedidos',
+  description: 'Sistema de comandas y atención digital local',
 };
 
 export default function RootLayout({
-    children,
+  children,
 }: {
-    children: React.ReactNode;
+  children: React.ReactNode;
 }) {
-    return (
-        <html lang="es">
-            <body className="bg-neutral-950 text-neutral-100 antialiased selection:bg-indigo-500 selection:text-white">
-                <CartProvider>{children}</CartProvider>
-            </body>
-        </html>
-    );
+  return (
+    <html lang="es">
+      <body className="bg-slate-100 text-slate-900 antialiased selection:bg-indigo-600 selection:text-white">
+        <CartProvider>{children}</CartProvider>
+      </body>
+    </html>
+  );
 }
