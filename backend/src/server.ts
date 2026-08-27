@@ -10,6 +10,17 @@ const httpServer = createServer(app);
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+// Migración automática de columnas para desglose de pagos en SQLite
+try {
+    db.exec(`
+    ALTER TABLE orders ADD COLUMN payment_cash REAL DEFAULT 0;
+    ALTER TABLE orders ADD COLUMN payment_card REAL DEFAULT 0;
+    ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT 'CASH';
+  `);
+} catch (e) {
+    // Las columnas ya existen, continuar normalmente
+}
+
 const io = new Server(httpServer, {
     cors: {
         origin: '*',
@@ -206,7 +217,6 @@ app.post('/api/service/alert', (req, res) => {
 
         console.log(`\n🔔 [ALERTA DE SERVICIO] ¡La mesa ${table} solicita mesero! (${timestamp})`);
 
-        // Emitir a todas las pantallas (Runner/Meseros, Barra, Caja)
         io.emit('service:alert', {
             table: table || 'Mesa',
             reason: reason || 'Solicitud de atención',
@@ -233,18 +243,22 @@ app.post('/api/service/resolve', (req, res) => {
     }
 });
 
-// Endpoint HTTP para cobrar y cerrar cuenta de una mesa
+// Endpoint HTTP para cobrar y cerrar cuenta de una mesa con métodos de pago
 app.post('/api/tables/close', (req, res) => {
     try {
-        const { table } = req.body;
+        const { table, cash = 0, card = 0, method = 'CASH' } = req.body;
+
         const updateStmt = db.prepare(`
       UPDATE orders 
-      SET status = 'COMPLETED' 
+      SET status = 'COMPLETED',
+          payment_cash = ?,
+          payment_card = ?,
+          payment_method = ?
       WHERE table_identifier = ? AND status != 'COMPLETED'
     `);
-        const result = updateStmt.run(table);
+        const result = updateStmt.run(Number(cash), Number(card), method, table);
 
-        console.log(`\n💳 [CUENTA COBRADA] ${table} cerrada. Comandas completadas: ${result.changes}`);
+        console.log(`\n💳 [CUENTA COBRADA] ${table} cerrada -> Efectivo: $${cash}, Tarjeta: $${card} (${method})`);
         io.emit('table:closed', { table });
 
         res.status(200).json({ success: true, closedOrders: result.changes });
@@ -255,13 +269,99 @@ app.post('/api/tables/close', (req, res) => {
 });
 
 // ----------------------------------------------------
+// REPORTES, AUDITORÍA Y CORTE DE CAJA
+// ----------------------------------------------------
+
+app.get('/api/reports/daily', (req, res) => {
+    try {
+        const targetDate = (req.query.date as string) || new Date().toISOString().slice(0, 10);
+
+        const salesSummary = db.prepare(`
+      SELECT 
+        COUNT(id) as totalOrders,
+        COALESCE(SUM(total), 0) as totalRevenue,
+        COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN total ELSE 0 END), 0) as collectedRevenue,
+        COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN payment_cash ELSE 0 END), 0) as totalCash,
+        COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN payment_card ELSE 0 END), 0) as totalCard,
+        COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) as completedOrders
+      FROM orders
+      WHERE substr(created_at, 1, 10) = ?
+    `).get(targetDate) as any;
+
+        const topProducts = db.prepare(`
+      SELECT 
+        oi.product_name as name,
+        SUM(oi.quantity) as totalQty,
+        SUM(oi.quantity * oi.unit_price) as totalAmount
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      WHERE substr(o.created_at, 1, 10) = ?
+      GROUP BY oi.product_name
+      ORDER BY totalQty DESC
+      LIMIT 6
+    `).all(targetDate) as any[];
+
+        const ordersHistory = db.prepare(`
+      SELECT 
+        o.id,
+        o.folio,
+        o.table_identifier as "table",
+        o.total,
+        o.payment_cash as paymentCash,
+        o.payment_card as paymentCard,
+        o.payment_method as paymentMethod,
+        o.status,
+        o.created_at as createdAt,
+        COALESCE(
+          (SELECT GROUP_CONCAT(product_name, ', ') 
+           FROM order_items 
+           WHERE order_id = o.id), 
+          'CONSUMO GENERAL'
+        ) as itemsSummary
+      FROM orders o
+      WHERE substr(o.created_at, 1, 10) = ?
+      ORDER BY o.created_at DESC
+    `).all(targetDate) as any[];
+
+        const totalRevenueVal = Number(salesSummary?.totalRevenue || 0);
+        const collectedRevenueVal = Number(salesSummary?.collectedRevenue || 0);
+        const totalCashVal = Number(salesSummary?.totalCash || 0);
+        const totalCardVal = Number(salesSummary?.totalCard || 0);
+        const totalOrdersCount = salesSummary?.totalOrders || 0;
+
+        const subtotal = Math.round((totalRevenueVal / 1.16) * 100) / 100;
+        const iva = Math.round((totalRevenueVal - subtotal) * 100) / 100;
+        const avgTicket = totalOrdersCount > 0 ? Math.round(totalRevenueVal / totalOrdersCount) : 0;
+
+        res.json({
+            date: targetDate,
+            summary: {
+                totalOrders: totalOrdersCount,
+                completedOrders: salesSummary?.completedOrders || 0,
+                subtotal,
+                iva,
+                totalRevenue: totalRevenueVal,
+                collectedRevenue: collectedRevenueVal,
+                totalCash: totalCashVal,
+                totalCard: totalCardVal,
+                averageTicket: avgTicket,
+            },
+            topProducts: topProducts || [],
+            orders: ordersHistory || [],
+        });
+    } catch (error) {
+        console.error('[API REPORT ERROR]', error);
+        res.status(500).json({ error: 'Error al generar reporte diario' });
+    }
+});
+
+// ----------------------------------------------------
 // EVENTOS WEBSOCKET (SOCKET.IO)
 // ----------------------------------------------------
 
 io.on('connection', (socket) => {
     console.log(`[SOCKET] Cliente conectado: ${socket.id}`);
 
-    // Guardar nueva orden vía Socket (clientes locales)
     socket.on('order:new', (data) => {
         try {
             processAndSaveOrder(data);
@@ -270,7 +370,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Actualizar estado (PENDING -> IN_PREPARATION -> READY -> COMPLETED)
     socket.on('order:status_update', (data) => {
         try {
             const idNumber = String(data.order_id).replace('ord-', '');
@@ -296,10 +395,13 @@ io.on('connection', (socket) => {
         try {
             const updateStmt = db.prepare(`
         UPDATE orders 
-        SET status = 'COMPLETED' 
+        SET status = 'COMPLETED',
+            payment_cash = ?,
+            payment_card = ?,
+            payment_method = ?
         WHERE table_identifier = ? AND status != 'COMPLETED'
       `);
-            updateStmt.run(data.table);
+            updateStmt.run(Number(data.cash || 0), Number(data.card || 0), data.method || 'CASH', data.table);
             io.emit('table:closed', { table: data.table });
         } catch (err) {
             console.error('[ERROR TABLE CLOSE SOCKET]', err);
@@ -312,81 +414,6 @@ io.on('connection', (socket) => {
 });
 
 const PORT = Number(process.env.PORT) || 4000;
-
-// ----------------------------------------------------
-// REPORTES, AUDITORÍA Y CORTE DE CAJA
-// ----------------------------------------------------
-
-// Obtener métricas consolidadas del día o fecha específica
-// Obtener métricas consolidadas del día con desglose de Subtotal e IVA
-app.get('/api/reports/daily', (req, res) => {
-    try {
-        const targetDate = (req.query.date as string) || new Date().toISOString().slice(0, 10);
-
-        // 1. Métricas Generales de Ventas
-        const salesSummary = db.prepare(`
-      SELECT 
-        COUNT(id) as totalOrders,
-        COALESCE(SUM(total), 0) as totalRevenue,
-        COALESCE(AVG(total), 0) as averageTicket,
-        COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN total ELSE 0 END), 0) as collectedRevenue,
-        COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) as completedOrders
-      FROM orders
-      WHERE substr(created_at, 1, 10) = ?
-    `).get(targetDate) as any;
-
-        // 2. Top Platillos Más Vendidos
-        const topProducts = db.prepare(`
-      SELECT 
-        oi.product_name as name,
-        SUM(oi.quantity) as totalQty,
-        SUM(oi.quantity * oi.unit_price) as totalAmount
-      FROM order_items oi
-      JOIN orders o ON oi.order_id = o.id
-      WHERE substr(o.created_at, 1, 10) = ?
-      GROUP BY oi.product_name
-      ORDER BY totalQty DESC
-      LIMIT 6
-    `).all(targetDate) as any[];
-
-        // 3. Historial Desglosado de Cuentas del Día
-        const ordersHistory = db.prepare(`
-      SELECT 
-        id, folio, table_identifier as "table", total, status, created_at as createdAt
-      FROM orders
-      WHERE substr(created_at, 1, 10) = ?
-      ORDER BY created_at DESC
-    `).all(targetDate) as any[];
-
-        const totalRevenueVal = Number(salesSummary?.totalRevenue || 0);
-        const collectedRevenueVal = Number(salesSummary?.collectedRevenue || 0);
-        const totalOrdersCount = salesSummary?.totalOrders || 0;
-
-        // Cálculo fiscal (IVA 16%)
-        const subtotal = Math.round((totalRevenueVal / 1.16) * 100) / 100;
-        const iva = Math.round((totalRevenueVal - subtotal) * 100) / 100;
-        const avgTicket = totalOrdersCount > 0 ? Math.round(totalRevenueVal / totalOrdersCount) : 0;
-
-        res.json({
-            date: targetDate,
-            summary: {
-                totalOrders: totalOrdersCount,
-                completedOrders: salesSummary?.completedOrders || 0,
-                subtotal,
-                iva,
-                totalRevenue: totalRevenueVal,
-                collectedRevenue: collectedRevenueVal,
-                averageTicket: avgTicket,
-                avgPrepMinutes: 7,
-            },
-            topProducts: topProducts || [],
-            orders: ordersHistory || [],
-        });
-    } catch (error) {
-        console.error('[API REPORT ERROR]', error);
-        res.status(500).json({ error: 'Error al generar reporte diario' });
-    }
-});
 
 httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[NEXORA CORE] Servidor local corriendo en http://localhost:${PORT}`);

@@ -15,7 +15,9 @@ import {
     UserCheck,
     CreditCard,
     Printer,
-    X
+    X,
+    Banknote,
+    Split
 } from 'lucide-react';
 
 interface OrderItem {
@@ -73,8 +75,17 @@ export default function CajaPage() {
     const [alerts, setAlerts] = useState<ServiceAlert[]>([]);
     const [isConnected, setIsConnected] = useState(false);
     const [audioUnlocked, setAudioUnlocked] = useState(false);
-    const [closingTable, setClosingTable] = useState<string | null>(null);
+
+    // Modales
     const [ticketToPrint, setTicketToPrint] = useState<{ table: string; items: TicketItem[]; total: number } | null>(null);
+    const [paymentModalTable, setPaymentModalTable] = useState<TableState | null>(null);
+
+    // Estado del Pago
+    const [paymentMode, setPaymentMode] = useState<'CASH' | 'CARD' | 'MIXED'>('CASH');
+    const [cashAmount, setCashAmount] = useState<string>('');
+    const [cardAmount, setCardAmount] = useState<string>('');
+    const [receivedCash, setReceivedCash] = useState<string>('');
+    const [isSubmittingPayment, setIsSubmittingPayment] = useState(false);
 
     const loadDatabaseState = async () => {
         try {
@@ -85,7 +96,6 @@ export default function CajaPage() {
                 const updatedTables: TableState[] = DEFAULT_TABLES.map((tableId) => {
                     const tableOrders = activeOrders.filter((o) => o.table === tableId);
 
-                    // Unir todos los platillos ordenados en esa mesa
                     const allItems: TicketItem[] = [];
                     tableOrders.forEach((o) => {
                         o.items?.forEach((item) => {
@@ -192,19 +202,63 @@ export default function CajaPage() {
         }
     };
 
-    const handleCloseTable = async (tableIdentifier: string) => {
-        if (!confirm(`¿Confirmar cobro y cierre de cuenta para ${tableIdentifier}?`)) return;
+    const handleOpenPaymentModal = (table: TableState) => {
+        setPaymentModalTable(table);
+        setPaymentMode('CASH');
+        setCashAmount(String(table.totalAccumulated));
+        setCardAmount('0');
+        setReceivedCash(String(table.totalAccumulated));
+    };
 
-        setClosingTable(tableIdentifier);
+    const handleModeChange = (mode: 'CASH' | 'CARD' | 'MIXED') => {
+        if (!paymentModalTable) return;
+        setPaymentMode(mode);
+        const total = paymentModalTable.totalAccumulated;
+
+        if (mode === 'CASH') {
+            setCashAmount(String(total));
+            setCardAmount('0');
+            setReceivedCash(String(total));
+        } else if (mode === 'CARD') {
+            setCashAmount('0');
+            setCardAmount(String(total));
+            setReceivedCash('0');
+        } else {
+            const half = Math.round(total / 2);
+            setCashAmount(String(half));
+            setCardAmount(String(total - half));
+            setReceivedCash(String(half));
+        }
+    };
+
+    const handleProcessPayment = async () => {
+        if (!paymentModalTable) return;
+
+        const total = paymentModalTable.totalAccumulated;
+        const finalCash = paymentMode === 'CARD' ? 0 : Number(cashAmount || 0);
+        const finalCard = paymentMode === 'CASH' ? 0 : Number(cardAmount || 0);
+
+        if (paymentMode === 'MIXED' && Math.round(finalCash + finalCard) !== Math.round(total)) {
+            alert(`La suma de Efectivo ($${finalCash}) y Tarjeta ($${finalCard}) debe ser igual al total ($${total}).`);
+            return;
+        }
+
+        setIsSubmittingPayment(true);
         try {
             const res = await fetch('/api/tables/close', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ table: tableIdentifier }),
+                body: JSON.stringify({
+                    table: paymentModalTable.identifier,
+                    cash: finalCash,
+                    card: finalCard,
+                    method: paymentMode,
+                }),
             });
 
             if (res.ok) {
                 playSound('order_sent');
+                setPaymentModalTable(null);
                 await loadDatabaseState();
             } else {
                 alert('Error al procesar el cierre de mesa.');
@@ -212,16 +266,8 @@ export default function CajaPage() {
         } catch (err) {
             console.error('[CLOSE TABLE ERROR]', err);
         } finally {
-            setClosingTable(null);
+            setIsSubmittingPayment(false);
         }
-    };
-
-    const handleOpenTicketModal = (table: TableState) => {
-        setTicketToPrint({
-            table: table.identifier,
-            items: table.items,
-            total: table.totalAccumulated,
-        });
     };
 
     const triggerPrint = () => {
@@ -233,9 +279,15 @@ export default function CajaPage() {
         setAudioUnlocked(true);
     };
 
+    const calcChange = () => {
+        const cashToPay = paymentMode === 'CARD' ? 0 : Number(cashAmount || 0);
+        const received = Number(receivedCash || 0);
+        return Math.max(0, received - cashToPay);
+    };
+
     return (
         <main className="min-h-screen bg-slate-100 text-slate-800 flex flex-col pb-16">
-            {/* Header Caja (Oculto al imprimir) */}
+            {/* Header Caja */}
             <header className="bg-white border-b border-slate-200 px-6 py-3.5 flex items-center justify-between shadow-sm print:hidden">
                 <div className="flex items-center gap-3">
                     <div className="p-2.5 bg-indigo-50 text-indigo-600 border border-indigo-100 rounded-xl shadow-sm">
@@ -245,7 +297,7 @@ export default function CajaPage() {
                         <h1 className="font-black text-lg text-slate-900 tracking-wide flex items-center gap-2">
                             NEXORA CAJA <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md border border-slate-200 font-bold">ADMIN</span>
                         </h1>
-                        <p className="text-xs text-slate-500 font-medium">Control de Cuentas, Cobros y Pre-cuentas</p>
+                        <p className="text-xs text-slate-500 font-medium">Control de Cuentas, Pagos y Pre-cuentas</p>
                     </div>
                 </div>
 
@@ -276,7 +328,7 @@ export default function CajaPage() {
                 </div>
             </header>
 
-            {/* Grid de Mesas (Oculto al imprimir) */}
+            {/* Grid de Mesas */}
             <div className="max-w-7xl mx-auto w-full p-6 grid grid-cols-1 lg:grid-cols-4 gap-6 flex-1 print:hidden">
                 {/* Columna Asistencia */}
                 <div className="lg:col-span-1 space-y-4">
@@ -323,7 +375,7 @@ export default function CajaPage() {
                             <Receipt className="w-4 h-4 text-indigo-600" />
                             <span>Monitoreo de Salón y Cuentas</span>
                         </div>
-                        <span className="text-xs text-slate-400 font-medium">Pre-cuentas con IVA 16% desglosado</span>
+                        <span className="text-xs text-slate-400 font-medium">Pre-cuentas y Cobro Multimétodo</span>
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -334,8 +386,8 @@ export default function CajaPage() {
                                 <div
                                     key={table.identifier}
                                     className={`bg-white border rounded-3xl p-5 shadow-xs flex flex-col justify-between space-y-4 transition-all ${isOccupied
-                                        ? 'border-indigo-200 ring-1 ring-indigo-500/20 shadow-md'
-                                        : 'border-slate-200/80 opacity-80'
+                                            ? 'border-indigo-200 ring-1 ring-indigo-500/20 shadow-md'
+                                            : 'border-slate-200/80 opacity-80'
                                         }`}
                                 >
                                     <div>
@@ -365,11 +417,17 @@ export default function CajaPage() {
                                         </div>
                                     </div>
 
-                                    {/* Botonera Doble: Imprimir Pre-cuenta & Cobrar */}
+                                    {/* Botonera: Imprimir Pre-cuenta & Cobrar */}
                                     {isOccupied && (
                                         <div className="grid grid-cols-2 gap-2 pt-2 border-t border-slate-100">
                                             <button
-                                                onClick={() => handleOpenTicketModal(table)}
+                                                onClick={() =>
+                                                    setTicketToPrint({
+                                                        table: table.identifier,
+                                                        items: table.items,
+                                                        total: table.totalAccumulated,
+                                                    })
+                                                }
                                                 className="py-2.5 px-3 bg-slate-100 hover:bg-slate-200 active:scale-95 text-slate-800 font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
                                             >
                                                 <Printer className="w-3.5 h-3.5 text-indigo-600" />
@@ -377,12 +435,11 @@ export default function CajaPage() {
                                             </button>
 
                                             <button
-                                                onClick={() => handleCloseTable(table.identifier)}
-                                                disabled={closingTable === table.identifier}
-                                                className="py-2.5 px-3 bg-slate-900 hover:bg-slate-800 active:scale-95 text-white font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
+                                                onClick={() => handleOpenPaymentModal(table)}
+                                                className="py-2.5 px-3 bg-slate-900 hover:bg-slate-800 active:scale-95 text-white font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer"
                                             >
                                                 <CreditCard className="w-3.5 h-3.5 text-emerald-400" />
-                                                <span>{closingTable === table.identifier ? 'Cerrando...' : 'Cobrar'}</span>
+                                                <span>Cobrar</span>
                                             </button>
                                         </div>
                                     )}
@@ -393,7 +450,148 @@ export default function CajaPage() {
                 </div>
             </div>
 
-            {/* Modal de Vista Previa de Ticket Térmico */}
+            {/* ========================================================= */}
+            {/* MODAL PARA PROCESAR PAGO (EFECTIVO / TARJETA / MIXTO)      */}
+            {/* ========================================================= */}
+            {paymentModalTable && (
+                <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+                    <div className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-5 animate-in fade-in zoom-in-95 duration-200">
+                        <div className="flex items-center justify-between border-b pb-3">
+                            <div>
+                                <h3 className="font-black text-base text-slate-900">
+                                    Cobrar Cuenta - {paymentModalTable.identifier}
+                                </h3>
+                                <p className="text-xs text-slate-500">Selecciona el método de pago del comensal</p>
+                            </div>
+                            <button
+                                onClick={() => setPaymentModalTable(null)}
+                                className="p-1 rounded-lg text-slate-400 hover:bg-slate-100"
+                            >
+                                <X className="w-5 h-5" />
+                            </button>
+                        </div>
+
+                        {/* Total a Pagar Destacado */}
+                        <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl flex items-center justify-between">
+                            <span className="text-xs font-black uppercase tracking-wider text-slate-500">Total a Liquidar</span>
+                            <span className="text-2xl font-black text-slate-900">${paymentModalTable.totalAccumulated} MXN</span>
+                        </div>
+
+                        {/* Selector de Método de Pago */}
+                        <div className="grid grid-cols-3 gap-2">
+                            <button
+                                type="button"
+                                onClick={() => handleModeChange('CASH')}
+                                className={`py-3 px-2 rounded-2xl border text-xs font-black flex flex-col items-center gap-1.5 transition-all cursor-pointer ${paymentMode === 'CASH'
+                                        ? 'bg-emerald-600 text-white border-emerald-600 shadow-md shadow-emerald-600/20'
+                                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                                    }`}
+                            >
+                                <Banknote className="w-4 h-4" />
+                                <span>Efectivo</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => handleModeChange('CARD')}
+                                className={`py-3 px-2 rounded-2xl border text-xs font-black flex flex-col items-center gap-1.5 transition-all cursor-pointer ${paymentMode === 'CARD'
+                                        ? 'bg-indigo-600 text-white border-indigo-600 shadow-md shadow-indigo-600/20'
+                                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                                    }`}
+                            >
+                                <CreditCard className="w-4 h-4" />
+                                <span>Tarjeta</span>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => handleModeChange('MIXED')}
+                                className={`py-3 px-2 rounded-2xl border text-xs font-black flex flex-col items-center gap-1.5 transition-all cursor-pointer ${paymentMode === 'MIXED'
+                                        ? 'bg-violet-600 text-white border-violet-600 shadow-md shadow-violet-600/20'
+                                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                                    }`}
+                            >
+                                <Split className="w-4 h-4" />
+                                <span>Mixto (Ambos)</span>
+                            </button>
+                        </div>
+
+                        {/* Campos Dinámicos según el modo */}
+                        {paymentMode === 'MIXED' && (
+                            <div className="grid grid-cols-2 gap-3 p-3.5 bg-violet-50 border border-violet-200 rounded-2xl">
+                                <div>
+                                    <label className="text-[10px] font-black uppercase text-violet-900">Efectivo ($)</label>
+                                    <input
+                                        type="number"
+                                        value={cashAmount}
+                                        onChange={(e) => {
+                                            const val = e.target.value;
+                                            setCashAmount(val);
+                                            setCardAmount(String(Math.max(0, paymentModalTable.totalAccumulated - Number(val))));
+                                        }}
+                                        className="w-full mt-1 p-2 bg-white border border-violet-300 rounded-xl text-sm font-black text-slate-900 outline-none"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] font-black uppercase text-violet-900">Tarjeta ($)</label>
+                                    <input
+                                        type="number"
+                                        value={cardAmount}
+                                        onChange={(e) => {
+                                            const val = e.target.value;
+                                            setCardAmount(val);
+                                            setCashAmount(String(Math.max(0, paymentModalTable.totalAccumulated - Number(val))));
+                                        }}
+                                        className="w-full mt-1 p-2 bg-white border border-violet-300 rounded-xl text-sm font-black text-slate-900 outline-none"
+                                    />
+                                </div>
+                            </div>
+                        )}
+
+                        {paymentMode !== 'CARD' && (
+                            <div className="space-y-3 p-3.5 bg-slate-50 border border-slate-200 rounded-2xl">
+                                <div className="flex items-center justify-between">
+                                    <label className="text-xs font-bold text-slate-600">Efectivo Recibido:</label>
+                                    <input
+                                        type="number"
+                                        value={receivedCash}
+                                        onChange={(e) => setReceivedCash(e.target.value)}
+                                        placeholder="0.00"
+                                        className="w-32 p-2 bg-white border border-slate-300 rounded-xl text-right font-black text-sm text-slate-900 outline-none"
+                                    />
+                                </div>
+
+                                <div className="flex items-center justify-between border-t border-slate-200 pt-2">
+                                    <span className="text-xs font-black text-slate-700 uppercase">Cambio a Regresar:</span>
+                                    <span className="text-base font-black text-emerald-600">${calcChange()} MXN</span>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Botón de Confirmación Final */}
+                        <div className="flex gap-3 pt-2">
+                            <button
+                                type="button"
+                                onClick={() => setPaymentModalTable(null)}
+                                className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-2xl text-xs uppercase"
+                            >
+                                Cancelar
+                            </button>
+                            <button
+                                type="button"
+                                disabled={isSubmittingPayment}
+                                onClick={handleProcessPayment}
+                                className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 active:scale-95 text-white font-black rounded-2xl text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg disabled:opacity-50 cursor-pointer"
+                            >
+                                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                                <span>{isSubmittingPayment ? 'Guardando...' : 'Confirmar Cobro'}</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Modal Pre-cuenta */}
             {ticketToPrint && (
                 <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 print:p-0 print:bg-white print:static">
                     <div className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 print:shadow-none print:p-0">
@@ -410,7 +608,6 @@ export default function CajaPage() {
                             </button>
                         </div>
 
-                        {/* Renderizado Térmico */}
                         <div className="bg-slate-50 border rounded-2xl p-2 max-h-[60vh] overflow-y-auto print:border-none print:p-0 print:max-h-none">
                             <ThermalTicket
                                 type="PRECUENTA"
@@ -420,7 +617,6 @@ export default function CajaPage() {
                             />
                         </div>
 
-                        {/* Controles de Impresión */}
                         <div className="flex gap-3 pt-2 print:hidden">
                             <button
                                 onClick={() => setTicketToPrint(null)}
@@ -439,7 +635,6 @@ export default function CajaPage() {
                     </div>
                 </div>
             )}
-
         </main>
     );
 }
