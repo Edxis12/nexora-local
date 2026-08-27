@@ -118,6 +118,7 @@ app.get('/api/orders/active', (req, res) => {
                 id: `ord-${order.id}`,
                 folio: order.folio,
                 table: order.table,
+                total: order.total,
                 status: order.status,
                 createdAt: formattedDate,
                 items: items
@@ -125,6 +126,7 @@ app.get('/api/orders/active', (req, res) => {
                     .map((item) => ({
                         name: item.name,
                         quantity: item.quantity,
+                        price: item.price,
                         modifiers: JSON.parse(item.selected_modifiers || '[]'),
                         notes: item.notes,
                     })),
@@ -135,6 +137,53 @@ app.get('/api/orders/active', (req, res) => {
     } catch (error) {
         console.error('[API ERROR] Error al obtener órdenes activas:', error);
         res.status(500).json({ error: 'Error al obtener órdenes activas' });
+    }
+});
+
+// Obtener órdenes listas para entrega en salón (App Meseros)
+app.get('/api/orders/ready', (req, res) => {
+    try {
+        const orders = db.prepare(`
+      SELECT id, folio, table_identifier as "table", total, status, created_at as createdAt
+      FROM orders
+      WHERE status = 'READY'
+      ORDER BY created_at ASC
+    `).all() as any[];
+
+        const items = db.prepare(`
+      SELECT id, order_id, product_name as name, quantity, unit_price as price, selected_modifiers, notes
+      FROM order_items
+    `).all() as any[];
+
+        const response = orders.map((order) => {
+            let formattedDate = order.createdAt;
+            if (typeof formattedDate === 'string' && !formattedDate.includes('T')) {
+                formattedDate = formattedDate.replace(' ', 'T') + 'Z';
+            }
+
+            return {
+                id: `ord-${order.id}`,
+                folio: order.folio,
+                table: order.table,
+                total: order.total,
+                status: order.status,
+                createdAt: formattedDate,
+                items: items
+                    .filter((item) => item.order_id === order.id)
+                    .map((item) => ({
+                        name: item.name,
+                        quantity: item.quantity,
+                        price: item.price,
+                        modifiers: JSON.parse(item.selected_modifiers || '[]'),
+                        notes: item.notes,
+                    })),
+            };
+        });
+
+        res.json(response);
+    } catch (error) {
+        console.error('[API ERROR] Error al obtener órdenes listas:', error);
+        res.status(500).json({ error: 'Error al obtener órdenes listas' });
     }
 });
 
@@ -157,17 +206,51 @@ app.post('/api/service/alert', (req, res) => {
 
         console.log(`\n🔔 [ALERTA DE SERVICIO] ¡La mesa ${table} solicita mesero! (${timestamp})`);
 
-        // Emitir a todas las pantallas (KDS, Barra, Caja)
+        // Emitir a todas las pantallas (Runner/Meseros, Barra, Caja)
         io.emit('service:alert', {
             table: table || 'Mesa',
             reason: reason || 'Solicitud de atención',
-            timestamp
+            timestamp,
         });
 
         res.status(200).json({ success: true, message: 'Alerta enviada al salón' });
     } catch (err) {
         console.error('[ERROR ALERTA MESERO HTTP]', err);
         res.status(500).json({ error: 'Error enviando alerta' });
+    }
+});
+
+// Endpoint HTTP para resolver/apagar alerta de llamado de mesero
+app.post('/api/service/resolve', (req, res) => {
+    try {
+        const { table } = req.body;
+        console.log(`\n✅ [SERVICIO ATENDIDO] Mesa ${table} fue atendida.`);
+        io.emit('service:resolved', { table });
+        res.status(200).json({ success: true, message: 'Alerta resuelta' });
+    } catch (err) {
+        console.error('[ERROR RESOLVER ALERTA HTTP]', err);
+        res.status(500).json({ error: 'Error resolviendo alerta' });
+    }
+});
+
+// Endpoint HTTP para cobrar y cerrar cuenta de una mesa
+app.post('/api/tables/close', (req, res) => {
+    try {
+        const { table } = req.body;
+        const updateStmt = db.prepare(`
+      UPDATE orders 
+      SET status = 'COMPLETED' 
+      WHERE table_identifier = ? AND status != 'COMPLETED'
+    `);
+        const result = updateStmt.run(table);
+
+        console.log(`\n💳 [CUENTA COBRADA] ${table} cerrada. Comandas completadas: ${result.changes}`);
+        io.emit('table:closed', { table });
+
+        res.status(200).json({ success: true, closedOrders: result.changes });
+    } catch (err) {
+        console.error('[ERROR COBRANDO MESA HTTP]', err);
+        res.status(500).json({ error: 'Error al cerrar cuenta de mesa' });
     }
 });
 
@@ -206,7 +289,21 @@ io.on('connection', (socket) => {
     });
 
     socket.on('service:resolve', (data) => {
-        io.emit('service:resolve', data);
+        io.emit('service:resolved', data);
+    });
+
+    socket.on('table:close', (data) => {
+        try {
+            const updateStmt = db.prepare(`
+        UPDATE orders 
+        SET status = 'COMPLETED' 
+        WHERE table_identifier = ? AND status != 'COMPLETED'
+      `);
+            updateStmt.run(data.table);
+            io.emit('table:closed', { table: data.table });
+        } catch (err) {
+            console.error('[ERROR TABLE CLOSE SOCKET]', err);
+        }
     });
 
     socket.on('disconnect', () => {
@@ -215,6 +312,81 @@ io.on('connection', (socket) => {
 });
 
 const PORT = Number(process.env.PORT) || 4000;
+
+// ----------------------------------------------------
+// REPORTES, AUDITORÍA Y CORTE DE CAJA
+// ----------------------------------------------------
+
+// Obtener métricas consolidadas del día o fecha específica
+// Obtener métricas consolidadas del día con desglose de Subtotal e IVA
+app.get('/api/reports/daily', (req, res) => {
+    try {
+        const targetDate = (req.query.date as string) || new Date().toISOString().slice(0, 10);
+
+        // 1. Métricas Generales de Ventas
+        const salesSummary = db.prepare(`
+      SELECT 
+        COUNT(id) as totalOrders,
+        COALESCE(SUM(total), 0) as totalRevenue,
+        COALESCE(AVG(total), 0) as averageTicket,
+        COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN total ELSE 0 END), 0) as collectedRevenue,
+        COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) as completedOrders
+      FROM orders
+      WHERE substr(created_at, 1, 10) = ?
+    `).get(targetDate) as any;
+
+        // 2. Top Platillos Más Vendidos
+        const topProducts = db.prepare(`
+      SELECT 
+        oi.product_name as name,
+        SUM(oi.quantity) as totalQty,
+        SUM(oi.quantity * oi.unit_price) as totalAmount
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      WHERE substr(o.created_at, 1, 10) = ?
+      GROUP BY oi.product_name
+      ORDER BY totalQty DESC
+      LIMIT 6
+    `).all(targetDate) as any[];
+
+        // 3. Historial Desglosado de Cuentas del Día
+        const ordersHistory = db.prepare(`
+      SELECT 
+        id, folio, table_identifier as "table", total, status, created_at as createdAt
+      FROM orders
+      WHERE substr(created_at, 1, 10) = ?
+      ORDER BY created_at DESC
+    `).all(targetDate) as any[];
+
+        const totalRevenueVal = Number(salesSummary?.totalRevenue || 0);
+        const collectedRevenueVal = Number(salesSummary?.collectedRevenue || 0);
+        const totalOrdersCount = salesSummary?.totalOrders || 0;
+
+        // Cálculo fiscal (IVA 16%)
+        const subtotal = Math.round((totalRevenueVal / 1.16) * 100) / 100;
+        const iva = Math.round((totalRevenueVal - subtotal) * 100) / 100;
+        const avgTicket = totalOrdersCount > 0 ? Math.round(totalRevenueVal / totalOrdersCount) : 0;
+
+        res.json({
+            date: targetDate,
+            summary: {
+                totalOrders: totalOrdersCount,
+                completedOrders: salesSummary?.completedOrders || 0,
+                subtotal,
+                iva,
+                totalRevenue: totalRevenueVal,
+                collectedRevenue: collectedRevenueVal,
+                averageTicket: avgTicket,
+                avgPrepMinutes: 7,
+            },
+            topProducts: topProducts || [],
+            orders: ordersHistory || [],
+        });
+    } catch (error) {
+        console.error('[API REPORT ERROR]', error);
+        res.status(500).json({ error: 'Error al generar reporte diario' });
+    }
+});
 
 httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[NEXORA CORE] Servidor local corriendo en http://localhost:${PORT}`);
