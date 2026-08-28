@@ -75,6 +75,18 @@ function processAndSaveOrder(data: any) {
     return broadcastPayload;
 }
 
+// Autenticacion de administrador / Encargado (pin o password)
+app.post('/api/admin/auth', (req, res) => {
+    const {pin} = req.body;
+    const ADMIN_PIN = process.env.ADMIN_PIN || '1234'; // Pin por defecto
+
+    if (String(pin) === String(ADMIN_PIN)) {
+        return res.json({success: true, token: 'nexora-admin-session-active'});
+    }
+
+    return res.status(401).json({error: 'PIN o contraseña incorrecta'});
+});
+
 // ----------------------------------------------------
 // RUTAS HTTP (REST API - CLIENTES Y SALÓN)
 // ----------------------------------------------------
