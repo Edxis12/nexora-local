@@ -76,10 +76,10 @@ function processAndSaveOrder(data: any) {
 }
 
 // ----------------------------------------------------
-// RUTAS HTTP (REST API)
+// RUTAS HTTP (REST API - CLIENTES Y SALÓN)
 // ----------------------------------------------------
 
-// Obtener el menú completo con modificadores asociados desde SQLite
+// Obtener el menú para los comensales (solo disponibles)
 app.get('/api/menu', (req, res) => {
     try {
         const products = db.prepare(`
@@ -104,7 +104,7 @@ app.get('/api/menu', (req, res) => {
     }
 });
 
-// Obtener comandas activas completas con ítems desglosados para KDS y Caja
+// Obtener comandas activas completas para KDS y Caja
 app.get('/api/orders/active', (req, res) => {
     try {
         const orders = db.prepare(`
@@ -198,7 +198,7 @@ app.get('/api/orders/ready', (req, res) => {
     }
 });
 
-// Endpoint HTTP para recibir pedidos desde el celular (Proxy Cloudflare)
+// Endpoint HTTP para recibir pedidos desde el celular
 app.post('/api/orders', (req, res) => {
     try {
         const broadcastPayload = processAndSaveOrder(req.body);
@@ -230,7 +230,7 @@ app.post('/api/service/alert', (req, res) => {
     }
 });
 
-// Endpoint HTTP para resolver/apagar alerta de llamado de mesero
+// Endpoint HTTP para resolver alerta de llamado de mesero
 app.post('/api/service/resolve', (req, res) => {
     try {
         const { table } = req.body;
@@ -352,6 +352,191 @@ app.get('/api/reports/daily', (req, res) => {
     } catch (error) {
         console.error('[API REPORT ERROR]', error);
         res.status(500).json({ error: 'Error al generar reporte diario' });
+    }
+});
+
+// ----------------------------------------------------
+// ADMINISTRACIÓN DEL MENÚ (CRUD, CATEGORÍAS & EXTRAS)
+// ----------------------------------------------------
+
+// 1. Obtener todas las categorías
+app.get('/api/admin/categories', (req, res) => {
+    try {
+        const categories = db.prepare('SELECT id, name FROM categories ORDER BY sort_order ASC, id ASC').all();
+        res.json(categories);
+    } catch (error) {
+        console.error('[API CATEGORIES ERROR]', error);
+        res.status(500).json({ error: 'Error al obtener categorías' });
+    }
+});
+
+// 2. Crear nueva categoría
+app.post('/api/admin/categories', (req, res) => {
+    try {
+        const { name, sortOrder = 0 } = req.body;
+        if (!name || !name.trim()) {
+            return res.status(400).json({ error: 'El nombre de la categoría es requerido' });
+        }
+
+        const stmt = db.prepare(`
+      INSERT INTO categories (name, sort_order)
+      VALUES (?, ?)
+    `);
+        const result = stmt.run(name.trim(), Number(sortOrder) || 0);
+
+        io.emit('menu:updated');
+        res.status(201).json({ success: true, id: result.lastInsertRowid, name: name.trim() });
+    } catch (error) {
+        console.error('[API CREATE CATEGORY ERROR]', error);
+        res.status(500).json({ error: 'Error al crear la categoría' });
+    }
+});
+
+// 3. Eliminar categoría
+app.delete('/api/admin/categories/:id', (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const count = db.prepare('SELECT COUNT(*) as total FROM products WHERE category_id = ?').get(id) as any;
+        if (count && count.total > 0) {
+            return res.status(400).json({ error: `No se puede eliminar: tiene ${count.total} platillos asociados` });
+        }
+
+        db.prepare('DELETE FROM categories WHERE id = ?').run(id);
+        io.emit('menu:updated');
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[API DELETE CATEGORY ERROR]', error);
+        res.status(500).json({ error: 'Error al eliminar categoría' });
+    }
+});
+
+// 4. Obtener catálogo completo para el Administrador con modificadores
+app.get('/api/admin/menu', (req, res) => {
+    try {
+        const products = db.prepare(`
+      SELECT p.id, p.name, p.description, p.price, p.image_url as image, p.category_id as categoryId, c.name as category, p.is_available as isAvailable
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      ORDER BY c.sort_order ASC, p.id ASC
+    `).all() as any[];
+
+        const modifiers = db.prepare('SELECT id, product_id, name, extra_price as extraPrice FROM modifiers').all() as any[];
+
+        const formatted = products.map((prod) => ({
+            ...prod,
+            modifiers: modifiers
+                .filter((m) => m.product_id === prod.id)
+                .map((m) => ({ id: m.id, name: m.name, extraPrice: m.extraPrice })),
+        }));
+
+        res.json(formatted);
+    } catch (error) {
+        console.error('[API ADMIN MENU ERROR]', error);
+        res.status(500).json({ error: 'Error al obtener menú admin' });
+    }
+});
+
+// 5. Switch de disponibilidad / modo agotado (86)
+app.patch('/api/admin/products/:id/toggle', (req, res) => {
+    try {
+        const { id } = req.params;
+        const { isAvailable } = req.body;
+
+        const stmt = db.prepare('UPDATE products SET is_available = ? WHERE id = ?');
+        stmt.run(isAvailable ? 1 : 0, id);
+
+        console.log(`[MENU] Platillo ID ${id} cambió disponibilidad a: ${isAvailable ? 'DISPONIBLE' : 'AGOTADO'}`);
+        io.emit('menu:updated');
+
+        res.json({ success: true, isAvailable });
+    } catch (error) {
+        console.error('[API TOGGLE AVAILABILITY ERROR]', error);
+        res.status(500).json({ error: 'Error al actualizar disponibilidad' });
+    }
+});
+
+// 6. Crear nuevo platillo con modificadores
+app.post('/api/admin/products', (req, res) => {
+    try {
+        const { name, description, price, image, categoryId, modifiers = [] } = req.body;
+
+        const stmt = db.prepare(`
+      INSERT INTO products (name, description, price, image_url, category_id, is_available)
+      VALUES (?, ?, ?, ?, ?, 1)
+    `);
+        const result = stmt.run(name, description || '', Number(price), image || '', categoryId || 1);
+        const productId = result.lastInsertRowid;
+
+        if (Array.isArray(modifiers) && modifiers.length > 0) {
+            const insertMod = db.prepare(`
+        INSERT INTO modifiers (product_id, name, extra_price)
+        VALUES (?, ?, ?)
+      `);
+            for (const mod of modifiers) {
+                if (mod.name && mod.name.trim()) {
+                    insertMod.run(productId, mod.name.trim(), Number(mod.extraPrice || 0));
+                }
+            }
+        }
+
+        io.emit('menu:updated');
+        res.status(201).json({ success: true, id: productId });
+    } catch (error) {
+        console.error('[API CREATE PRODUCT ERROR]', error);
+        res.status(500).json({ error: 'Error al crear platillo' });
+    }
+});
+
+// 7. Editar platillo existente y actualizar sus modificadores
+app.put('/api/admin/products/:id', (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, description, price, image, categoryId, modifiers = [] } = req.body;
+
+        const stmt = db.prepare(`
+      UPDATE products 
+      SET name = ?, description = ?, price = ?, image_url = ?, category_id = ?
+      WHERE id = ?
+    `);
+        stmt.run(name, description || '', Number(price), image || '', categoryId || 1, id);
+
+        // Reemplazar modificadores asociados
+        db.prepare('DELETE FROM modifiers WHERE product_id = ?').run(id);
+
+        if (Array.isArray(modifiers) && modifiers.length > 0) {
+            const insertMod = db.prepare(`
+        INSERT INTO modifiers (product_id, name, extra_price)
+        VALUES (?, ?, ?)
+      `);
+            for (const mod of modifiers) {
+                if (mod.name && mod.name.trim()) {
+                    insertMod.run(id, mod.name.trim(), Number(mod.extraPrice || 0));
+                }
+            }
+        }
+
+        io.emit('menu:updated');
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[API UPDATE PRODUCT ERROR]', error);
+        res.status(500).json({ error: 'Error al actualizar platillo' });
+    }
+});
+
+// 8. Eliminar platillo
+app.delete('/api/admin/products/:id', (req, res) => {
+    try {
+        const { id } = req.params;
+        db.prepare('DELETE FROM products WHERE id = ?').run(id);
+        db.prepare('DELETE FROM modifiers WHERE product_id = ?').run(id);
+
+        io.emit('menu:updated');
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[API DELETE PRODUCT ERROR]', error);
+        res.status(500).json({ error: 'Error al eliminar platillo' });
     }
 });
 
